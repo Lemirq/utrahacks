@@ -337,6 +337,73 @@ bool shouldSweep() {
 
 // ========== LINE FOLLOWING ==========
 
+// Check if color is valid (something we can follow)
+bool isValidColor(Color c) {
+  return c == BLACK || c == RED || c == GREEN || c == BLUE;
+}
+
+// Single sweep cycle: right -> left -> center, returns true if found
+bool doSweepCycle(int sweepWidth, int sweepDelay) {
+  // Sweep RIGHT while checking
+  for (int i = 0; i < sweepWidth; i++) {
+    turnRight();
+    delay(sweepDelay);
+
+    Color c = readColor();
+    if (isValidColor(c)) {
+      stopMotors();
+      Serial.print(F("[SEARCH] Found "));
+      Serial.print(colorName(c));
+      Serial.println(F(" - advancing"));
+      moveForward();
+      delay(300);
+      searchForwardMs = 150;
+      return true;
+    }
+  }
+  stopMotors();
+
+  // Sweep LEFT (back past center to other side)
+  for (int i = 0; i < sweepWidth * 2; i++) {
+    turnLeft();
+    delay(sweepDelay);
+
+    Color c = readColor();
+    if (isValidColor(c)) {
+      stopMotors();
+      Serial.print(F("[SEARCH] Found "));
+      Serial.print(colorName(c));
+      Serial.println(F(" - advancing"));
+      moveForward();
+      delay(300);
+      searchForwardMs = 150;
+      return true;
+    }
+  }
+  stopMotors();
+
+  // Sweep back to center
+  for (int i = 0; i < sweepWidth; i++) {
+    turnRight();
+    delay(sweepDelay);
+
+    Color c = readColor();
+    if (isValidColor(c)) {
+      stopMotors();
+      Serial.print(F("[SEARCH] Found "));
+      Serial.print(colorName(c));
+      Serial.println(F(" - advancing"));
+      moveForward();
+      delay(300);
+      searchForwardMs = 150;
+      return true;
+    }
+  }
+  stopMotors();
+
+  return false;
+}
+
 void findLine() {
   Serial.print(F("[SEARCH] Lost at RGB="));
   Serial.print(lastR);
@@ -347,56 +414,97 @@ void findLine() {
 
   stopMotors();
 
-  // Try right
-  for (int i = 0; i < 5; i++) {
-    turnRight();
-    delay(80);
+  int sweepDelay = 50;            // ms per step
+  int sweepsPerSpot = 3;          // Sweeps before advancing
+  int maxAdvances = 6;            // Max times to advance before giving up
+  int advanceDistance = 150;      // How far to advance each time
+  int angleAdjust = 0;            // Angle adjustment (ms of turn)
+  int angleStep = 40;             // How much to increase angle each advance
+  bool turnDirection = true;      // true = try right first, false = left first
+
+  for (int advance = 0; advance < maxAdvances; advance++) {
+    int sweepWidth = 5;  // Reset sweep width at each new spot
+
+    Serial.print(F("[SEARCH] Position #"));
+    Serial.println(advance + 1);
+
+    // Do multiple sweeps at this spot, widening each time
+    for (int sweep = 0; sweep < sweepsPerSpot; sweep++) {
+      Serial.print(F("[SEARCH] Sweep "));
+      Serial.print(sweep + 1);
+      Serial.print(F("/"));
+      Serial.print(sweepsPerSpot);
+      Serial.print(F(" width="));
+      Serial.println(sweepWidth);
+
+      if (doSweepCycle(sweepWidth, sweepDelay)) {
+        return;  // Found it!
+      }
+
+      sweepWidth += 3;  // Widen for next sweep
+    }
+
+    // Didn't find it at this spot - advance with angle adjustment
+    if (angleAdjust > 0) {
+      Serial.print(F("[SEARCH] Turn "));
+      Serial.print(turnDirection ? F("RIGHT ") : F("LEFT "));
+      Serial.print(angleAdjust);
+      Serial.println(F("ms"));
+
+      if (turnDirection) {
+        turnRight();
+      } else {
+        turnLeft();
+      }
+      delay(angleAdjust);
+      stopMotors();
+
+      // Check after turn
+      Color c = readColor();
+      if (isValidColor(c)) {
+        Serial.print(F("[SEARCH] Found "));
+        Serial.print(colorName(c));
+        Serial.println(F(" after turn"));
+        moveForward();
+        delay(200);
+        return;
+      }
+    }
+
+    // Advance forward
+    Serial.print(F("[SEARCH] Advance "));
+    Serial.print(advanceDistance);
+    Serial.println(F("ms"));
+
+    moveForward();
+    delay(advanceDistance);
     stopMotors();
-    if (readColor() == BLACK) {
-      Serial.println(F("[SEARCH] Found RIGHT - advancing"));
-      // Found it! Move forward optimistically
+
+    // Check immediately after advancing
+    Color c = readColor();
+    if (isValidColor(c)) {
+      Serial.print(F("[SEARCH] Found "));
+      Serial.print(colorName(c));
+      Serial.println(F(" after advance"));
       moveForward();
-      delay(250);
-      searchForwardMs = 150;  // Reset since we found it
+      delay(200);
       return;
+    }
+
+    advanceDistance += 50;    // Go further each time
+    angleAdjust += angleStep; // Turn more each time
+
+    // Alternate turn direction every 2 advances
+    if ((advance + 1) % 2 == 0) {
+      turnDirection = !turnDirection;
     }
   }
 
-  // Try left (go back past center)
-  for (int i = 0; i < 10; i++) {
-    turnLeft();
-    delay(80);
-    stopMotors();
-    if (readColor() == BLACK) {
-      Serial.println(F("[SEARCH] Found LEFT - advancing"));
-      // Found it! Move forward optimistically
-      moveForward();
-      delay(250);
-      searchForwardMs = 150;  // Reset since we found it
-      return;
-    }
-  }
-
-  // Return to center
-  for (int i = 0; i < 5; i++) {
-    turnRight();
-    delay(80);
-  }
-  stopMotors();
-
-  // Didn't find it - move forward with increasing distance
-  Serial.print(F("[SEARCH] Not found, advancing "));
-  Serial.print(searchForwardMs);
-  Serial.println(F("ms"));
-
+  // Exhausted all attempts
+  Serial.println(F("[SEARCH] Giving up, moving forward"));
   moveForward();
-  delay(searchForwardMs);
+  delay(400);
   stopMotors();
-
-  // Increase forward distance for next sweep (up to a max)
-  if (searchForwardMs < 500) {
-    searchForwardMs += 50;
-  }
 }
 
 void handleFork() {
@@ -483,7 +591,7 @@ void loop() {
 
     case RED:
     case GREEN:
-      handleFork();
+      moveForward();
       break;
 
     case BLUE:
