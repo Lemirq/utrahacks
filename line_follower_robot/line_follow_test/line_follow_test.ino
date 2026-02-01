@@ -414,96 +414,78 @@ void findLine() {
 
   stopMotors();
 
-  int sweepDelay = 50;            // ms per step
-  int sweepsPerSpot = 3;          // Sweeps before advancing
-  int maxAdvances = 6;            // Max times to advance before giving up
-  int advanceDistance = 150;      // How far to advance each time
-  int angleAdjust = 0;            // Angle adjustment (ms of turn)
-  int angleStep = 40;             // How much to increase angle each advance
-  bool turnDirection = true;      // true = try right first, false = left first
+  int sweepDelay = 40;
+  int sweepWidth = 4;             // Starting sweep width
+  int sweepGrowth = 3;            // How much to grow sweep each time
+  int maxSweeps = 12;             // Max sweep attempts
 
-  for (int advance = 0; advance < maxAdvances; advance++) {
-    int sweepWidth = 5;  // Reset sweep width at each new spot
+  // Phase 1: Try advancing forward a couple times first
+  Serial.println(F("[SEARCH] Phase 1: Try forward"));
+  for (int fwd = 0; fwd < 2; fwd++) {
+    // Quick sweep
+    if (doSweepCycle(sweepWidth, sweepDelay)) return;
 
-    Serial.print(F("[SEARCH] Position #"));
-    Serial.println(advance + 1);
-
-    // Do multiple sweeps at this spot, widening each time
-    for (int sweep = 0; sweep < sweepsPerSpot; sweep++) {
-      Serial.print(F("[SEARCH] Sweep "));
-      Serial.print(sweep + 1);
-      Serial.print(F("/"));
-      Serial.print(sweepsPerSpot);
-      Serial.print(F(" width="));
-      Serial.println(sweepWidth);
-
-      if (doSweepCycle(sweepWidth, sweepDelay)) {
-        return;  // Found it!
-      }
-
-      sweepWidth += 3;  // Widen for next sweep
-    }
-
-    // Didn't find it at this spot - advance with angle adjustment
-    if (angleAdjust > 0) {
-      Serial.print(F("[SEARCH] Turn "));
-      Serial.print(turnDirection ? F("RIGHT ") : F("LEFT "));
-      Serial.print(angleAdjust);
-      Serial.println(F("ms"));
-
-      if (turnDirection) {
-        turnRight();
-      } else {
-        turnLeft();
-      }
-      delay(angleAdjust);
-      stopMotors();
-
-      // Check after turn
-      Color c = readColor();
-      if (isValidColor(c)) {
-        Serial.print(F("[SEARCH] Found "));
-        Serial.print(colorName(c));
-        Serial.println(F(" after turn"));
-        moveForward();
-        delay(200);
-        return;
-      }
-    }
-
-    // Advance forward
-    Serial.print(F("[SEARCH] Advance "));
-    Serial.print(advanceDistance);
-    Serial.println(F("ms"));
-
+    // Try advancing a little
+    Serial.print(F("[SEARCH] Forward attempt "));
+    Serial.println(fwd + 1);
     moveForward();
-    delay(advanceDistance);
+    delay(120);
     stopMotors();
 
-    // Check immediately after advancing
     Color c = readColor();
     if (isValidColor(c)) {
       Serial.print(F("[SEARCH] Found "));
       Serial.print(colorName(c));
-      Serial.println(F(" after advance"));
+      Serial.println(F(" - continuing"));
       moveForward();
-      delay(200);
+      delay(150);
       return;
     }
 
-    advanceDistance += 50;    // Go further each time
-    angleAdjust += angleStep; // Turn more each time
+    sweepWidth += sweepGrowth;
+  }
 
-    // Alternate turn direction every 2 advances
-    if ((advance + 1) % 2 == 0) {
-      turnDirection = !turnDirection;
+  // Phase 2: Forward didn't work - it's probably a turn
+  // Focus entirely on sweeping with aggressively increasing angle
+  Serial.println(F("[SEARCH] Phase 2: Turn mode - widening sweeps"));
+
+  for (int sweep = 0; sweep < maxSweeps; sweep++) {
+    Serial.print(F("[SEARCH] Sweep #"));
+    Serial.print(sweep + 1);
+    Serial.print(F(" width="));
+    Serial.println(sweepWidth);
+
+    if (doSweepCycle(sweepWidth, sweepDelay)) {
+      return;  // Found it!
+    }
+
+    // Aggressively increase sweep width
+    sweepWidth += sweepGrowth;
+    sweepGrowth++;  // Growth itself increases: +3, +4, +5, +6...
+
+    // Every few sweeps, nudge forward just a tiny bit
+    if (sweep > 0 && sweep % 4 == 0) {
+      Serial.println(F("[SEARCH] Small nudge forward"));
+      moveForward();
+      delay(80);
+      stopMotors();
+
+      Color c = readColor();
+      if (isValidColor(c)) {
+        Serial.print(F("[SEARCH] Found "));
+        Serial.print(colorName(c));
+        Serial.println(F(" after nudge"));
+        moveForward();
+        delay(150);
+        return;
+      }
     }
   }
 
-  // Exhausted all attempts
-  Serial.println(F("[SEARCH] Giving up, moving forward"));
+  // Last resort: one more forward push
+  Serial.println(F("[SEARCH] Last resort - pushing forward"));
   moveForward();
-  delay(400);
+  delay(300);
   stopMotors();
 }
 
