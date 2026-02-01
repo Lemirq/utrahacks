@@ -22,6 +22,20 @@ const int S2 = A2;
 const int S3 = A3;
 const int COLOR_OUT = A4;
 
+// --- Ultrasonic Sensor ---
+const int TRIG = 11;
+const int ECHO = 12;
+const int ULTRASONIC_TIMEOUT = 30000;
+
+// --- IR Obstacle Sensors ---
+// TODO: Update these pins to match your wiring
+const int IR_LEFT = 2;   // Left-facing IR sensor
+const int IR_RIGHT = 6;  // Right-facing IR sensor
+
+// --- Obstacle Detection Thresholds ---
+const int OBSTACLE_DIST_CM = 15;      // Stop if obstacle closer than this (ultrasonic)
+const bool IR_ACTIVE_LOW = true;      // true if IR outputs LOW when obstacle detected
+
 const int READ_TIMEOUT = 50000;
 
 // --- STATISTICAL THRESHOLDS (mean ± 3σ from calibration data) ---
@@ -99,6 +113,14 @@ void setup() {
   digitalWrite(S0, HIGH);
   digitalWrite(S1, LOW);
 
+  // Ultrasonic sensor
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  // IR obstacle sensors
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
   // Initialize history to UNKNOWN
   for (int i = 0; i < HISTORY_SIZE; i++) {
     colorHistory[i] = UNKNOWN;
@@ -141,6 +163,30 @@ void turnRight() {
   digitalWrite(IN4, HIGH);
 }
 
+// Slow in-place turns using PWM for search sweeps
+void turnLeftSlow(int speed) {
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRightSlow(int speed) {
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void restoreFullSpeed() {
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+}
+
 void turnLeft90() {
   turnLeft();
   delay(TURN_90_DELAY);
@@ -151,6 +197,95 @@ void turnRight90() {
   turnRight();
   delay(TURN_90_DELAY);
   stopMotors();
+}
+
+// ========== OBSTACLE DETECTION ==========
+
+// Get distance from ultrasonic sensor in cm (-1 if no echo)
+long getDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long duration = pulseIn(ECHO, HIGH, ULTRASONIC_TIMEOUT);
+  if (duration == 0) return -1;
+  return duration * 0.034 / 2;
+}
+
+// Check if left IR sensor detects obstacle
+bool obstacleLeft() {
+  bool reading = digitalRead(IR_LEFT);
+  return IR_ACTIVE_LOW ? !reading : reading;
+}
+
+// Check if right IR sensor detects obstacle
+bool obstacleRight() {
+  bool reading = digitalRead(IR_RIGHT);
+  return IR_ACTIVE_LOW ? !reading : reading;
+}
+
+// Check if front ultrasonic detects obstacle
+bool obstacleFront() {
+  long dist = getDistance();
+  if (dist < 0) return false;  // No reading = no obstacle
+  return dist < OBSTACLE_DIST_CM;
+}
+
+// Check all obstacle sensors, returns: 0=clear, 1=left, 2=right, 3=both/front
+int checkObstacles() {
+  bool front = obstacleFront();
+  bool left = obstacleLeft();
+  bool right = obstacleRight();
+
+  if (front) return 3;           // Front blocked
+  if (left && right) return 3;   // Both sides blocked
+  if (left) return 1;            // Left blocked
+  if (right) return 2;           // Right blocked
+  return 0;                      // Clear
+}
+
+// Handle obstacle - returns true if obstacle was handled
+bool handleObstacle() {
+  int obstacle = checkObstacles();
+
+  if (obstacle == 0) return false;  // No obstacle
+
+  stopMotors();
+
+  Serial.print(F("[OBSTACLE] Detected: "));
+  switch (obstacle) {
+    case 1: Serial.println(F("LEFT")); break;
+    case 2: Serial.println(F("RIGHT")); break;
+    case 3: Serial.println(F("FRONT/BOTH")); break;
+  }
+
+  // Avoid obstacle
+  switch (obstacle) {
+    case 1:  // Left blocked - veer right
+      turnRight();
+      delay(200);
+      break;
+    case 2:  // Right blocked - veer left
+      turnLeft();
+      delay(200);
+      break;
+    case 3:  // Front blocked - back up and turn
+      // Back up
+      digitalWrite(IN1, LOW);
+      digitalWrite(IN2, HIGH);
+      digitalWrite(IN3, LOW);
+      digitalWrite(IN4, HIGH);
+      delay(300);
+      stopMotors();
+      // Turn right to find new path
+      turnRight();
+      delay(400);
+      break;
+  }
+
+  stopMotors();
+  return true;
 }
 
 // ========== COLOR SENSOR ==========
@@ -342,65 +477,59 @@ bool isValidColor(Color c) {
   return c == BLACK || c == RED || c == GREEN || c == BLUE;
 }
 
-// Single sweep cycle: right -> left -> center, returns true if found
-bool doSweepCycle(int sweepWidth, int sweepDelay) {
-  // Sweep RIGHT while checking
-  for (int i = 0; i < sweepWidth; i++) {
-    turnRight();
-    delay(sweepDelay);
+// Slow 90° sweep in one direction with continuous color checking
+// Returns true if path color found (and stops immediately)
+// goLeft: true = turn left, false = turn right
+bool slowSweep90(bool goLeft, int durationMs, int checkIntervalMs, int speed) {
+  unsigned long start = millis();
+  const char* direction = goLeft ? "LEFT" : "RIGHT";
 
+  Serial.print(F("[SWEEP] Starting "));
+  Serial.print(direction);
+  Serial.print(F(" 90deg (speed="));
+  Serial.print(speed);
+  Serial.println(F(")"));
+
+  // Start slow in-place rotation
+  if (goLeft) {
+    turnLeftSlow(speed);
+  } else {
+    turnRightSlow(speed);
+  }
+
+  int checksPerformed = 0;
+
+  // Continuously check while rotating
+  while (millis() - start < (unsigned long)durationMs) {
     Color c = readColor();
+    checksPerformed++;
+
     if (isValidColor(c)) {
       stopMotors();
-      Serial.print(F("[SEARCH] Found "));
+      restoreFullSpeed();
+      Serial.print(F("[SWEEP] "));
+      Serial.print(direction);
+      Serial.print(F(" found "));
       Serial.print(colorName(c));
-      Serial.println(F(" - advancing"));
-      moveForward();
-      delay(300);
-      searchForwardMs = 150;
+      Serial.print(F(" after "));
+      Serial.print(millis() - start);
+      Serial.print(F("ms ("));
+      Serial.print(checksPerformed);
+      Serial.println(F(" checks)"));
       return true;
     }
+
+    delay(checkIntervalMs);
   }
+
+  // Completed without finding
   stopMotors();
-
-  // Sweep LEFT (back past center to other side)
-  for (int i = 0; i < sweepWidth * 2; i++) {
-    turnLeft();
-    delay(sweepDelay);
-
-    Color c = readColor();
-    if (isValidColor(c)) {
-      stopMotors();
-      Serial.print(F("[SEARCH] Found "));
-      Serial.print(colorName(c));
-      Serial.println(F(" - advancing"));
-      moveForward();
-      delay(300);
-      searchForwardMs = 150;
-      return true;
-    }
-  }
-  stopMotors();
-
-  // Sweep back to center
-  for (int i = 0; i < sweepWidth; i++) {
-    turnRight();
-    delay(sweepDelay);
-
-    Color c = readColor();
-    if (isValidColor(c)) {
-      stopMotors();
-      Serial.print(F("[SEARCH] Found "));
-      Serial.print(colorName(c));
-      Serial.println(F(" - advancing"));
-      moveForward();
-      delay(300);
-      searchForwardMs = 150;
-      return true;
-    }
-  }
-  stopMotors();
-
+  restoreFullSpeed();
+  Serial.print(F("[SWEEP] "));
+  Serial.print(direction);
+  Serial.print(F(" complete - nothing found ("));
+  Serial.print(checksPerformed);
+  Serial.println(F(" checks)"));
   return false;
 }
 
@@ -414,79 +543,30 @@ void findLine() {
 
   stopMotors();
 
-  int sweepDelay = 40;
-  int sweepWidth = 4;             // Starting sweep width
-  int sweepGrowth = 3;            // How much to grow sweep each time
-  int maxSweeps = 12;             // Max sweep attempts
+  // === TUNABLE CONSTANTS ===
+  const int SWEEP_DURATION_MS = 1200;  // Time for 90° rotation (adjust for your motors)
+  const int CHECK_INTERVAL_MS = 10;    // Check color every 10ms while rotating
+  const int SWEEP_SPEED = 80;          // PWM speed (0-255), lower = slower
 
-  // Phase 1: Try advancing forward a couple times first
-  Serial.println(F("[SEARCH] Phase 1: Try forward"));
-  for (int fwd = 0; fwd < 2; fwd++) {
-    // Quick sweep
-    if (doSweepCycle(sweepWidth, sweepDelay)) return;
-
-    // Try advancing a little
-    Serial.print(F("[SEARCH] Forward attempt "));
-    Serial.println(fwd + 1);
+  // Slow 90° LEFT sweep with continuous color checking
+  if (slowSweep90(true, SWEEP_DURATION_MS, CHECK_INTERVAL_MS, SWEEP_SPEED)) {
     moveForward();
-    delay(120);
-    stopMotors();
-
-    Color c = readColor();
-    if (isValidColor(c)) {
-      Serial.print(F("[SEARCH] Found "));
-      Serial.print(colorName(c));
-      Serial.println(F(" - continuing"));
-      moveForward();
-      delay(150);
-      return;
-    }
-
-    sweepWidth += sweepGrowth;
+    delay(150);
+    return;
   }
 
-  // Phase 2: Forward didn't work - it's probably a turn
-  // Focus entirely on sweeping with aggressively increasing angle
-  Serial.println(F("[SEARCH] Phase 2: Turn mode - widening sweeps"));
-
-  for (int sweep = 0; sweep < maxSweeps; sweep++) {
-    Serial.print(F("[SEARCH] Sweep #"));
-    Serial.print(sweep + 1);
-    Serial.print(F(" width="));
-    Serial.println(sweepWidth);
-
-    if (doSweepCycle(sweepWidth, sweepDelay)) {
-      return;  // Found it!
-    }
-
-    // Aggressively increase sweep width
-    sweepWidth += sweepGrowth;
-    sweepGrowth++;  // Growth itself increases: +3, +4, +5, +6...
-
-    // Every few sweeps, nudge forward just a tiny bit
-    if (sweep > 0 && sweep % 4 == 0) {
-      Serial.println(F("[SEARCH] Small nudge forward"));
-      moveForward();
-      delay(80);
-      stopMotors();
-
-      Color c = readColor();
-      if (isValidColor(c)) {
-        Serial.print(F("[SEARCH] Found "));
-        Serial.print(colorName(c));
-        Serial.println(F(" after nudge"));
-        moveForward();
-        delay(150);
-        return;
-      }
-    }
+  // If left didn't find it, try right (180° from current position = 90° right of original)
+  if (slowSweep90(false, SWEEP_DURATION_MS * 2, CHECK_INTERVAL_MS, SWEEP_SPEED)) {
+    moveForward();
+    delay(150);
+    return;
   }
 
-  // Last resort: one more forward push
-  Serial.println(F("[SEARCH] Last resort - pushing forward"));
+  // Fallback: return to roughly center and move forward
+  Serial.println(F("[SEARCH] Nothing found - moving forward"));
+  slowSweep90(true, SWEEP_DURATION_MS, CHECK_INTERVAL_MS, SWEEP_SPEED);  // Back to center-ish
   moveForward();
-  delay(300);
-  stopMotors();
+  delay(200);
 }
 
 void handleFork() {
@@ -541,6 +621,11 @@ void handleFork() {
 // ========== MAIN LOOP ==========
 
 void loop() {
+  // Check for obstacles first - takes priority over line following
+  if (handleObstacle()) {
+    return;  // Obstacle was handled, skip line following this cycle
+  }
+
   Color current = readColor();
 
   // Add to history periodically
